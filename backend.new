@@ -1,0 +1,663 @@
+import os
+import re
+import math
+import shutil
+import uuid
+import json
+import time
+from datetime import datetime
+from typing import List, Dict, Optional
+
+import requests
+import psycopg2
+from difflib import SequenceMatcher
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+
+from langchain_community.document_loaders import PyMuPDFLoader
+from langchain_core.embeddings import Embeddings
+from langchain_community.vectorstores.pgvector import PGVector
+from langchain_openai import ChatOpenAI
+from langchain.chains import create_history_aware_retriever, create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.documents import Document
+
+
+# Config (env or defaults)
+
+EMBEDDING_URL   = os.getenv("LMSTUDIO_EMBED_URL",  "http://localhost:1234/v1/embeddings")
+CHAT_API_BASE   = os.getenv("LMSTUDIO_API_BASE",   "http://localhost:1234/v1")
+EMBED_MODEL     = os.getenv("LMSTUDIO_EMBED_MODEL","nomic-embed-text-v1.5")
+CHAT_MODEL      = os.getenv("LMSTUDIO_CHAT_MODEL", "qwen3-4b")
+
+PG_CONN_STRING  = os.getenv("PG_DSN", "postgresql+psycopg2://postgres:12345@localhost:5432/chat_history")
+COLLECTION_NAME = os.getenv("PGVECTOR_COLLECTION", "hierarchical_embeddings")
+TEMP_UPLOAD_DIR = os.getenv("TEMP_UPLOAD_DIR", "temp_uploads")
+os.makedirs(TEMP_UPLOAD_DIR, exist_ok=True)
+
+# ---- Chunking knobs ----
+CHUNK_HARD_MAX      = int(os.getenv("CHUNK_HARD_MAX", "850"))     # smaller => more chunks
+CHUNK_OVERLAP_CHARS = int(os.getenv("CHUNK_OVERLAP", "120"))
+PARA_FALLBACK_WIDTH = int(os.getenv("PARA_FALLBACK_WIDTH", "380"))
+HEADING_STRICTNESS  = int(os.getenv("HEADING_STRICTNESS", "1"))   # 0=loose,1=default,2=conservative
+
+
+# FastAPI
+
+app = FastAPI(title="DocuBuddy — API")
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+)
+
+def get_db_connection():
+    try:
+        return psycopg2.connect(
+            dbname=os.getenv("PG_DB", "chat_history"),
+            user=os.getenv("PG_USER", "postgres"),
+            password=os.getenv("PG_PASS", "12345"),
+            host=os.getenv("PG_HOST", "localhost"),
+            port=os.getenv("PG_PORT", "5432"),
+            connect_timeout=10
+        )
+    except Exception as e:
+        print(f"Database connection error: {e}")
+        raise HTTPException(status_code=500, detail="Database connection failed")
+
+
+# Embeddings via LM Studio
+
+class CustomEmbeddings(Embeddings):
+    def __init__(self, model_name: str = EMBED_MODEL):
+        self.model_name = model_name
+        self.max_retries = 3
+        self.timeout = 900  # 15m
+
+    def _make_embedding_request(self, inputs: List[str]):
+        for attempt in range(self.max_retries):
+            try:
+                res = requests.post(
+                    EMBEDDING_URL,
+                    headers={"Content-Type": "application/json"},
+                    json={"input": inputs, "model": self.model_name},
+                    timeout=self.timeout
+                )
+                res.raise_for_status()
+                return res.json()
+            except Exception as e:
+                if attempt == self.max_retries - 1:
+                    print(f"[embeddings] final attempt failed: {e}")
+                    raise
+                print(f"[embeddings] attempt {attempt+1} failed: {e}")
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        result = self._make_embedding_request(texts)
+        return [item["embedding"] for item in result["data"]]
+
+    def embed_query(self, text: str) -> List[float]:
+        result = self._make_embedding_request([text])
+        return result["data"][0]["embedding"]
+
+embedding_function = CustomEmbeddings()
+
+
+# Chat LLM (LM Studio)
+
+llm = ChatOpenAI(
+    model_name=CHAT_MODEL,
+    openai_api_base=CHAT_API_BASE,
+    openai_api_key="not-needed",
+    temperature=0.2,      # factual style for RAG
+    max_retries=3,
+    request_timeout=900,  # 15 minutes
+    max_tokens=512
+)
+
+
+# Hierarchical chunker (aggressive)
+
+class HierarchicalChunker:
+    def process_document(self, file_path: str) -> List[Document]:
+        try:
+            loader = PyMuPDFLoader(file_path)
+            pages = loader.load()
+        except Exception as e:
+            print(f"PyMuPDFLoader error: {e}")
+            raise HTTPException(status_code=500, detail=f"PDF load error: {str(e)}")
+
+        chunks: List[Document] = []
+        for page_idx, page in enumerate(pages):
+            text = (page.page_content or "").replace("\r\n", "\n").strip()
+            if not text:
+                continue
+
+            paras = [b.strip() for b in text.split("\n\n") if b.strip()]
+            if not paras:
+                lines = [l.strip() for l in text.split("\n") if l.strip()]
+                buf, cur, blocks = [], 0, []
+                for ln in lines:
+                    if cur + len(ln) + 1 > PARA_FALLBACK_WIDTH and buf:
+                        blocks.append(" ".join(buf)); buf = [ln]; cur = len(ln) + 1
+                    else:
+                        buf.append(ln); cur += len(ln) + 1
+                if buf: blocks.append(" ".join(buf))
+                paras = blocks if blocks else [text]
+
+            for block in paras:
+                level = self._infer_level(block)
+                meta = {
+                    "source": file_path,
+                    "element_type": "heading" if level <= 3 else "paragraph",
+                    "page_number": page_idx + 1,
+                    "hierarchy_level": level,
+                    "element_id": str(uuid.uuid4())
+                }
+                chunks.extend(self._chunk_by_size(block, meta))
+
+        if not chunks:
+            raise HTTPException(status_code=500, detail="No chunks produced from PDF")
+        return chunks
+
+    def _infer_level(self, block: str) -> int:
+        first = block.split("\n")[0].strip()
+        wc = len(first.split())
+        is_all_caps = first.replace(" ", "").isupper()
+        ends_colon = first.endswith(":")
+
+        if HEADING_STRICTNESS == 0:  # loose
+            if (wc <= 8 and is_all_caps) or (wc <= 5 and ends_colon): return 1
+            if wc <= 10: return 2
+            if wc <= 14: return 3
+            return 5
+        elif HEADING_STRICTNESS == 2:  # conservative
+            if (wc <= 4 and is_all_caps) or (wc <= 3 and ends_colon): return 1
+            if wc <= 6: return 2
+            if wc <= 9: return 3
+            return 5
+        else:  # default
+            if (wc <= 6 and is_all_caps) or (wc <= 4 and ends_colon): return 1
+            if wc <= 8 or ends_colon: return 2
+            if wc <= 12: return 3
+            return 5
+
+    def _chunk_by_size(self, text: str, metadata: Dict) -> List[Document]:
+        base_sizes = {1: 900, 2: 800, 3: 700, 4: 600, 5: 520, 6: 420, 7: 360}
+        level = metadata.get("hierarchy_level", 5)
+        chunk_size = min(base_sizes.get(level, 520), CHUNK_HARD_MAX)
+        overlap_chars = min(CHUNK_OVERLAP_CHARS, max(0, chunk_size // 3))
+
+        words = text.split()
+        buf: List[str] = []
+        cur = 0
+        out: List[Document] = []
+
+        for w in words:
+            wlen = len(w) + 1
+            if cur + wlen > chunk_size and buf:
+                chunk_text = " ".join(buf)
+                meta = metadata.copy()
+                meta.update({"chunk_size": len(chunk_text), "chunk_index": len(out)})
+                out.append(Document(page_content=chunk_text, metadata=meta))
+
+                if overlap_chars > 0:
+                    chars = 0
+                    ov = []
+                    for ww in reversed(buf):
+                        ov.insert(0, ww)
+                        chars += len(ww) + 1
+                        if chars >= overlap_chars:
+                            break
+                    buf = ov + [w]
+                    cur = sum(len(t) + 1 for t in buf)
+                else:
+                    buf = [w]; cur = len(w) + 1
+            else:
+                buf.append(w); cur += wlen
+
+        if buf:
+            chunk_text = " ".join(buf)
+            meta = metadata.copy()
+            meta.update({"chunk_size": len(chunk_text), "chunk_index": len(out)})
+            out.append(Document(page_content=chunk_text, metadata=meta))
+        return out
+
+
+# Precise citation extraction
+
+def _cosine(a, b):
+    if not a or not b: return 0.0
+    dot = sum(x*y for x, y in zip(a, b))
+    na = math.sqrt(sum(x*x for x in a))
+    nb = math.sqrt(sum(y*y for y in b))
+    return 0.0 if na == 0 or nb == 0 else dot/(na*nb)
+
+def extract_precise_citations(
+    docs, query: str, answer: str,
+    top_per_doc: int = 1, min_sim: float = 0.50,
+    max_sentences_per_doc: int = 40, batch_size: int = 8
+):
+    if not docs:
+        return []
+    qa_text = (query or "") + " " + (answer or "")
+    try:
+        qa_emb = embedding_function.embed_query(qa_text)
+    except Exception:
+        qa_emb = None
+
+    out = []
+    for d in docs:
+        text = (d.page_content or "").strip()
+        if not text:
+            continue
+
+        sentences = []
+        buf = ""
+        for ch in text[:8000]:
+            buf += ch
+            if ch in ".?!\n":
+                s = buf.strip()
+                if s:
+                    sentences.append(s)
+                buf = ""
+        if buf.strip():
+            sentences.append(buf.strip())
+        if not sentences:
+            continue
+        sentences = sentences[:max_sentences_per_doc]
+
+        scored = []
+        if qa_emb:
+            for i in range(0, len(sentences), batch_size):
+                batch = sentences[i:i+batch_size]
+                try:
+                    embs = embedding_function.embed_documents(batch)
+                except Exception:
+                    embs = [None]*len(batch)
+                for s, se in zip(batch, embs):
+                    sim = _cosine(qa_emb, se) if se else 0.0
+                    scored.append((sim, s))
+        else:
+            qwords = set(w.lower() for w in qa_text.split())
+            for s in sentences:
+                sw = set(w.lower() for w in s.split())
+                inter = len(qwords & sw)
+                sim = inter / (len(sw) + 1e-6)
+                scored.append((sim, s))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top = [(s, sim) for (sim, s) in scored if sim >= min_sim][:top_per_doc]
+        if not top and scored:
+            top = [(scored[0][1], scored[0][0])]
+
+        m = d.metadata or {}
+        for snippet, _ in top:
+            out.append({
+                "page": m.get("page_number"),
+                "type": m.get("element_type"),
+                "level": m.get("hierarchy_level"),
+                "source": m.get("source"),
+                "preview": snippet
+            })
+    return out
+
+
+# Answer sanitization (strip chain-of-thought)
+
+def sanitize_answer(text: str) -> str:
+    if not text:
+        return text
+    # Remove <think>…</think>
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    # Remove common reasoning formats
+    patterns = [
+        r"(?im)^\s*(analysis|reasoning|thoughts?|inner monologue)\s*:\s*.*?$",
+        r"(?is)```(?:thoughts?|reasoning|analysis)[\s\S]*?```",
+        r"(?is)^#+\s*(thoughts?|reasoning|analysis)\b.*?$",
+    ]
+    for p in patterns:
+        text = re.sub(p, "", text, flags=re.DOTALL)
+    # Trim, keep first 2 paragraphs
+    parts = [p.strip() for p in text.split("\n") if p.strip()]
+    text = "\n".join(parts[:2]).strip()
+    return text if text else "I don't know based on the provided documents."
+
+
+# DB helpers
+
+def save_hierarchical_chunks(chunks: List[Document], session_id: str):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        for chunk in chunks:
+            chunk_id = str(uuid.uuid4())
+            meta = dict(chunk.metadata or {})
+            meta["session_id"] = session_id
+            meta_json = json.dumps(meta)
+            cur.execute(
+                """INSERT INTO hierarchical_documents 
+                   (id, session_id, content, metadata, hierarchy_level, element_type, created_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (
+                    chunk_id,
+                    session_id,
+                    chunk.page_content,
+                    meta_json,
+                    meta.get("hierarchy_level", 5),
+                    meta.get("element_type", "paragraph"),
+                    datetime.utcnow()
+                )
+            )
+        conn.commit()
+    except Exception as e:
+        if conn: conn.rollback()
+        print(f"Error saving chunks: {e}")
+        raise HTTPException(status_code=500, detail=f"Error saving chunks: {str(e)}")
+    finally:
+        if conn: conn.close()
+
+def save_message(session_id: str, role: str, content: str):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO chat_messages (session_id, role, content) VALUES (%s, %s, %s)",
+            (session_id, role, content)
+        )
+        conn.commit()
+    except Exception as e:
+        print(f"Error saving message: {e}")
+        raise
+    finally:
+        if conn: conn.close()
+
+def save_qa(session_id: str, question: str, answer: str):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO chat_qa (id, session_id, question, answer) VALUES (%s, %s, %s, %s)",
+            (str(uuid.uuid4()), session_id, question, answer)
+        )
+        conn.commit()
+    except Exception as e:
+        print(f"Error saving Q&A: {e}")
+        raise
+    finally:
+        if conn: conn.close()
+
+def fetch_chat_history(session_id: str, limit: int = 10):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT role, content FROM chat_messages WHERE session_id = %s ORDER BY timestamp DESC LIMIT %s",
+            (session_id, limit)
+        )
+        rows = cur.fetchall()[::-1]
+        return [HumanMessage(c) if r == "human" else AIMessage(c) for r, c in rows]
+    except Exception as e:
+        print(f"Error fetching chat history: {e}")
+        return []
+    finally:
+        if conn: conn.close()
+
+def find_similar_question(session_id: str, current_query: str, threshold: float = 0.85) -> Optional[str]:
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT question, answer FROM chat_qa WHERE session_id = %s", (session_id,))
+        for past_q, past_a in cur.fetchall():
+            if SequenceMatcher(None, current_query.lower(), past_q.lower()).ratio() >= threshold:
+                return past_a
+        return None
+    except Exception as e:
+        print(f"Error finding similar questions: {e}")
+        return None
+    finally:
+        if conn: conn.close()
+
+
+# API
+
+@app.post("/upload_pdf")
+async def upload_pdf(file: UploadFile = File(...), session_id: str = Form(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+
+    file_path = os.path.join(TEMP_UPLOAD_DIR, f"temp_{uuid.uuid4().hex}.pdf")
+    try:
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        chunker = HierarchicalChunker()
+        hierarchical_chunks = chunker.process_document(file_path)
+        if not hierarchical_chunks:
+            raise HTTPException(status_code=500, detail="No content extracted from PDF")
+
+        for ch in hierarchical_chunks:
+            ch.metadata = dict(ch.metadata or {})
+            ch.metadata["session_id"] = session_id
+
+        save_hierarchical_chunks(hierarchical_chunks, session_id)
+
+        vectorstore = PGVector(
+            connection_string=PG_CONN_STRING,
+            collection_name=COLLECTION_NAME,
+            embedding_function=embedding_function
+        )
+        vectorstore.add_documents(hierarchical_chunks)
+
+        return JSONResponse({
+            "message": f"PDF processed with {len(hierarchical_chunks)} hierarchical chunks",
+            "chunks_created": len(hierarchical_chunks)
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Unhandled upload error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        try: os.remove(file_path)
+        except Exception: pass
+
+@app.post("/chat")
+async def chat_endpoint(data: dict):
+    try:
+        session_id = data.get("session_id")
+        user_input = data.get("query")
+        source_filter = data.get("source")  # optional document filter
+
+        if not session_id or not user_input:
+            raise HTTPException(status_code=400, detail="Missing session_id or query")
+
+        similar_answer = find_similar_question(session_id, user_input)
+        if similar_answer:
+            clean = sanitize_answer(similar_answer)
+            save_message(session_id, "human", user_input)
+            save_message(session_id, "ai", clean)
+            save_qa(session_id, user_input, clean)
+            return JSONResponse({"answer": clean, "sources": []})
+
+        chat_history = fetch_chat_history(session_id, limit=10)
+
+        vectorstore = PGVector(
+            connection_string=PG_CONN_STRING,
+            collection_name=COLLECTION_NAME,
+            embedding_function=embedding_function
+        )
+
+        vc_filter: Dict[str, str] = {"session_id": session_id}
+        if source_filter:
+            vc_filter["source"] = source_filter
+
+        retriever = vectorstore.as_retriever(
+            search_type="mmr",
+            search_kwargs={
+                "k": 3,
+                "fetch_k": 10,
+                "lambda_mult": 0.5,
+                "filter": vc_filter,
+            }
+        )
+
+        contextualize_prompt = ChatPromptTemplate.from_messages([
+            ("system", "Rewrite the latest user question as a standalone question, preserving intent and key details."),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}")
+        ])
+
+        qa_prompt = ChatPromptTemplate.from_messages([
+            ("system",
+             "You are a helpful assistant for document QA.\n"
+             "Use ONLY the provided context to answer concisely.\n"
+             "If the answer is not in the context, reply exactly: \"I don't know based on the provided documents.\"\n"
+             "IMPORTANT RULES:\n"
+             "- Do NOT include analysis, chain-of-thought, or hidden reasoning.\n"
+             "- Do NOT use general knowledge beyond the context.\n"
+             "- Output ONLY the final answer sentence(s), no preface, no notes.\n\n"
+             "Context:\n{context}"
+            ),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}")
+        ])
+
+        history_aware_retriever = create_history_aware_retriever(llm, retriever, contextualize_prompt)
+        qa_chain = create_stuff_documents_chain(llm, qa_prompt)
+        rag_chain = create_retrieval_chain(history_aware_retriever, qa_chain)
+
+        result = rag_chain.invoke({"input": user_input, "chat_history": chat_history})
+
+        answer = result.get("answer") or result.get("output_text") or "I couldn't generate a response."
+        answer = sanitize_answer(answer)
+
+        docs = result.get("context", []) or []
+        sources = extract_precise_citations(docs, user_input, answer, top_per_doc=1, min_sim=0.50)
+
+        save_message(session_id, "human", user_input)
+        save_message(session_id, "ai", answer)
+        save_qa(session_id, user_input, answer)
+
+        return JSONResponse({"answer": answer, "sources": sources})
+
+    except Exception as e:
+        print(f"Chat error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/chat_history/{session_id}")
+async def get_chat_history(session_id: str, limit: int = 50):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT role, content, timestamp FROM chat_messages WHERE session_id = %s ORDER BY timestamp ASC LIMIT %s",
+            (session_id, limit)
+        )
+        rows = cur.fetchall()
+        history = [{"role": r, "content": c, "timestamp": t.isoformat()} for (r, c, t) in rows]
+        return JSONResponse({"history": history})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn: conn.close()
+
+@app.get("/documents")
+async def list_documents(session_id: str):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT
+                COALESCE((metadata->>'source'), 'unknown') AS source,
+                COUNT(*) AS chunks,
+                MIN((metadata->>'page_number')::int) AS min_page,
+                MAX((metadata->>'page_number')::int) AS max_page
+            FROM hierarchical_documents
+            WHERE session_id = %s
+            GROUP BY source
+            ORDER BY source ASC
+        """, (session_id,))
+        rows = cur.fetchall()
+        docs = []
+        for source, chunks, min_page, max_page in rows:
+            docs.append({
+                "source": source,
+                "chunks": int(chunks),
+                "pages": f"{(min_page or 1)}–{(max_page or 1)}"
+            })
+        return JSONResponse({"documents": docs})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn: conn.close()
+
+@app.delete("/chat_history/{session_id}")
+async def clear_chat_history(session_id: str):
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM chat_messages WHERE session_id = %s", (session_id,))
+        msg_count = cur.rowcount
+        cur.execute("DELETE FROM chat_qa WHERE session_id = %s", (session_id,))
+        qa_count = cur.rowcount
+        conn.commit()
+        return JSONResponse({"message": f"Cleared {msg_count} messages and {qa_count} Q&A pairs"})
+    except Exception as e:
+        if conn: conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn: conn.close()
+
+@app.get("/latency")
+async def latency_probe():
+    """Measure latency of embedding + a tiny LLM call (warm-up)."""
+    try:
+        t0 = time.time()
+        _ = embedding_function.embed_query("warmup probe")
+        t1 = time.time()
+        tiny = ChatOpenAI(
+            model_name=CHAT_MODEL,
+            openai_api_base=CHAT_API_BASE,
+            openai_api_key="not-needed",
+            temperature=0.0,
+            max_retries=1,
+            request_timeout=60,
+            max_tokens=16
+        )
+        _ = tiny.invoke("Return 'ok'.")
+        t2 = time.time()
+        return {
+            "embedding_ms": int((t1 - t0) * 1000),
+            "llm_ms": int((t2 - t1) * 1000),
+            "total_ms": int((t2 - t0) * 1000),
+            "embed_model": EMBED_MODEL,
+            "chat_model": CHAT_MODEL
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/health")
+async def health_check():
+    try:
+        conn = get_db_connection(); conn.close()
+        test = embedding_function.embed_query("healthcheck")
+        if not test:
+            raise ValueError("Empty embedding")
+        return JSONResponse({"status": "healthy"})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    # Increase keep-alive timeout for long calls
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")), timeout_keep_alive=900)
